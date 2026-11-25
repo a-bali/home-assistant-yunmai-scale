@@ -184,7 +184,6 @@ class PreReadyAttributionTests(unittest.TestCase):
 
 class IgnoredCycleReportingTests(unittest.TestCase):
     """A dropped cycle must be visible without enabling debug logging."""
-
     def test_ignored_cycle_is_counted_and_reasoned(self):
         manager = make_manager()
         self.assertEqual(manager.ignored_cycle_count, 0)

@@ -955,6 +955,7 @@ class YunmaiScaleManager:
         ignore_live_until = 0.0
         last_final_signature: tuple[Any, ...] | None = None
         last_final_at = 0.0
+        pre_ready_deadline = 0.0
 
         def _notification_callback(_sender: Any, data: bytearray) -> None:
             nonlocal notification_count
@@ -1046,10 +1047,11 @@ class YunmaiScaleManager:
             # plateau may be lost. Keep processing normally — a plateau that
             # continues after `ready` still recognises the user — and fall
             # back to the scale's own final frame if recognition does not
-            # happen. The timeout below bounds how long that fallback stays
-            # armed, so a stale flag cannot outlive the weigh-in that set it.
+            # happen. The fallback is bounded by one measurement timeout, so a
+            # flag set by a weigh-in that ended during bootstrap cannot outlive
+            # it.
             pre_ready_cycle = True
-            cycle_started_at = loop.time()
+            pre_ready_deadline = loop.time() + MEASUREMENT_TIMEOUT_SECONDS
             _LOGGER.info(
                 "Yunmai measurement began before the connection reached ready; "
                 "its final frame will be used if recognition was missed"
@@ -1064,22 +1066,24 @@ class YunmaiScaleManager:
                 raise BleakError("Scale disconnected")
 
             now = loop.time()
+            if pre_ready_cycle and now >= pre_ready_deadline:
+                # The weigh-in that started during bootstrap never produced a
+                # final frame. Say so instead of forgetting it.
+                self._note_ignored_cycle(
+                    "the weigh-in started before the connection was ready and "
+                    "the scale sent no final frame",
+                    None,
+                )
+                pre_ready_cycle = False
+
             if (
                 cycle_started_at is not None
                 and now - cycle_started_at >= MEASUREMENT_TIMEOUT_SECONDS
             ):
-                if pre_ready_cycle:
-                    self._note_ignored_cycle(
-                        "the weigh-in started before the connection was ready "
-                        "and the scale sent no final frame",
-                        None,
-                    )
-                    pre_ready_cycle = False
-                else:
-                    _LOGGER.info(
-                        "Yunmai incomplete measurement timed out; "
-                        "remaining connected"
-                    )
+                _LOGGER.info(
+                    "Yunmai incomplete measurement timed out; "
+                    "remaining connected"
+                )
                 _reset_cycle()
                 self._set_status("ready")
 
