@@ -95,6 +95,8 @@ class YunmaiScaleManager:
         self.last_user_uid: int | None = None
         self.status = "starting"
         self.last_error: str | None = None
+        self.ignored_cycle_count = 0
+        self.last_ignored_reason: str | None = None
 
         self._store = Store(
             hass,
@@ -166,6 +168,8 @@ class YunmaiScaleManager:
             "profile_count": len(self.profiles),
             "stored_measurement_count": len(self.measurements),
             "has_last_user": self.last_user_uid is not None,
+            "ignored_cycle_count": self.ignored_cycle_count,
+            "last_ignored_reason": self.last_ignored_reason,
             "recognition": {
                 "max_relative_difference": self.max_relative_difference,
                 "min_second_best_margin_kg": self.min_second_best_margin_kg,
@@ -397,6 +401,63 @@ class YunmaiScaleManager:
         self.status = status
         self.last_error = error
         async_dispatcher_send(self.hass, self.signal)
+
+    def _note_ignored_cycle(self, reason: str, weight_kg: float | None) -> None:
+        """Record a dropped measurement cycle so it is never silent.
+
+        A dropped cycle is a data-loss event, not routine operation: it is
+        logged at WARNING (the integration's default log level) and counted
+        in diagnostics, so ``stored_measurement_count`` staying at zero
+        cannot be mistaken for "nobody weighed in".
+        """
+        self.ignored_cycle_count += 1
+        self.last_ignored_reason = reason
+        if weight_kg is None:
+            _LOGGER.warning("Yunmai measurement cycle ignored: %s", reason)
+        else:
+            _LOGGER.warning(
+                "Yunmai measurement cycle ignored: %s (final weight %.2f kg)",
+                reason,
+                weight_kg,
+            )
+        async_dispatcher_send(self.hass, self.signal)
+
+    def _attribute_pre_ready_frame(
+        self, frame: ParsedFrame
+    ) -> YunmaiProfile | None:
+        """Attribute a measurement whose live plateau was missed.
+
+        When a weigh-in begins before the persistent connection reaches
+        ``ready`` the live frames that drive recognition are lost, so the
+        profile is taken from the user ID the scale echoes in its final
+        frame instead. That ID is only trusted when it belongs to a
+        configured profile *and* the final weight still agrees with that
+        profile's reference weight, which keeps a stale or foreign ID from
+        writing a measurement to the wrong user.
+        """
+        if not frame.user_id:
+            return None
+        profile = self.profiles_by_uid.get(frame.user_id)
+        if profile is None:
+            return None
+        if frame.weight_kg is None:
+            return None
+
+        reference = self.get_reference_weight(profile)
+        allowed = reference * self.max_relative_difference
+        if abs(frame.weight_kg - reference) > allowed:
+            _LOGGER.warning(
+                "Yunmai final user ID 0x%08X maps to %s, but %.2f kg is "
+                "outside the ±%.0f%% recognition window around %.2f kg; "
+                "result not stored",
+                frame.user_id,
+                profile.name,
+                frame.weight_kg,
+                self.max_relative_difference * 100,
+                reference,
+            )
+            return None
+        return profile
 
     def _choose_profile(self, weight_kg: float) -> YunmaiProfile | None:
         """Return an unambiguous nearest profile for the live weight."""
@@ -881,7 +942,7 @@ class YunmaiScaleManager:
         notification_count = 0
         accepting_measurements = False
         measurement_seen_before_ready = False
-        reject_cycle_until_final = False
+        pre_ready_cycle = False
         self.notification_session_id = generation
         self.notification_callback_id = callback_id
         self.notification_count = 0
@@ -975,17 +1036,25 @@ class YunmaiScaleManager:
         ):
             raise BleakError("Scale disconnected before Yunmai ready state")
 
+        loop = asyncio.get_running_loop()
+
         self._set_status("ready")
         accepting_measurements = True
-        reject_cycle_until_final = measurement_seen_before_ready
-        if reject_cycle_until_final:
+        if measurement_seen_before_ready:
+            # Live frames for a weigh-in that is already in progress arrived
+            # while the session was still bootstrapping, so its recognition
+            # plateau may be lost. Keep processing normally — a plateau that
+            # continues after `ready` still recognises the user — and fall
+            # back to the scale's own final frame if recognition does not
+            # happen. The timeout below bounds how long that fallback stays
+            # armed, so a stale flag cannot outlive the weigh-in that set it.
+            pre_ready_cycle = True
+            cycle_started_at = loop.time()
             _LOGGER.info(
                 "Yunmai measurement began before the connection reached ready; "
-                "ignoring this complete measurement cycle"
+                "its final frame will be used if recognition was missed"
             )
         _LOGGER.info("Yunmai persistent connection is ready")
-
-        loop = asyncio.get_running_loop()
 
         while not self._stop_event.is_set():
             if (
@@ -999,11 +1068,19 @@ class YunmaiScaleManager:
                 cycle_started_at is not None
                 and now - cycle_started_at >= MEASUREMENT_TIMEOUT_SECONDS
             ):
-                _LOGGER.info(
-                    "Yunmai incomplete measurement timed out; remaining connected"
-                )
+                if pre_ready_cycle:
+                    self._note_ignored_cycle(
+                        "the weigh-in started before the connection was ready "
+                        "and the scale sent no final frame",
+                        None,
+                    )
+                    pre_ready_cycle = False
+                else:
+                    _LOGGER.info(
+                        "Yunmai incomplete measurement timed out; "
+                        "remaining connected"
+                    )
                 _reset_cycle()
-                reject_cycle_until_final = False
                 self._set_status("ready")
 
             try:
@@ -1023,32 +1100,6 @@ class YunmaiScaleManager:
                 raw.hex(" "),
             )
             now = loop.time()
-
-            if reject_cycle_until_final:
-                if frame.kind == "measuring" and frame.weight_kg is not None:
-                    if frame.weight_kg >= MIN_HUMAN_WEIGHT_KG:
-                        if cycle_started_at is None:
-                            cycle_started_at = now
-                            self._set_status("measuring")
-                        last_live_at = now
-                    continue
-                if frame.kind == "measured":
-                    last_final_signature = (
-                        frame.user_id,
-                        frame.weight_kg,
-                        frame.impedance_raw,
-                        frame.fat_percent,
-                    )
-                    last_final_at = now
-                    _LOGGER.info(
-                        "Ignored Yunmai final frame because this measurement "
-                        "started during reconnect/bootstrap"
-                    )
-                    reject_cycle_until_final = False
-                    _reset_cycle()
-                    ignore_live_until = now + POST_FINAL_GUARD_SECONDS
-                    self._set_status("ready")
-                    continue
 
             if frame.kind == "measuring" and frame.weight_kg is not None:
                 if frame.weight_kg < MIN_HUMAN_WEIGHT_KG or now < ignore_live_until:
@@ -1084,6 +1135,7 @@ class YunmaiScaleManager:
                     continue
 
                 selected_profile = profile
+                pre_ready_cycle = False
                 stable_weight = median(candidate_weights)
                 _LOGGER.info(
                     "Recognized %s from %.2f kg live plateau (spread %.2f kg)",
@@ -1112,6 +1164,36 @@ class YunmaiScaleManager:
 
             last_final_signature = signature
             last_final_at = now
+
+            if selected_profile is None and pre_ready_cycle:
+                # Recognition never saw the plateau because this weigh-in
+                # started before the session was ready. The scale's final
+                # frame still carries the weight and the user ID it chose, so
+                # the measurement is recoverable as long as the ID belongs to
+                # a configured profile and the weight agrees with it.
+                pre_ready_cycle = False
+                profile = self._attribute_pre_ready_frame(frame)
+                if profile is None:
+                    self._note_ignored_cycle(
+                        "the weigh-in started before the connection was ready "
+                        "and its final frame could not be attributed to a "
+                        "configured profile",
+                        frame.weight_kg,
+                    )
+                else:
+                    await self._async_save_measurement(profile, frame)
+                    _LOGGER.info(
+                        "Yunmai final (recovered pre-ready): %s %.2f kg, "
+                        "fat=%s, impedance=%s",
+                        profile.name,
+                        frame.weight_kg,
+                        frame.fat_percent,
+                        frame.impedance_raw,
+                    )
+                _reset_cycle()
+                ignore_live_until = now + POST_FINAL_GUARD_SECONDS
+                self._set_status("ready")
+                continue
 
             if selected_profile is None:
                 _LOGGER.info(

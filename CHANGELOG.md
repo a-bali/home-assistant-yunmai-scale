@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- A weigh-in that begins before the persistent connection reaches `ready` is
+  recovered from the scale's final frame instead of being discarded. This
+  affected any session where the scale woke and reported live weight while the
+  integration was still bootstrap-connecting, which is the normal case over a
+  Bluetooth proxy: the cycle completed and the session returned to `ready`
+  with no measurement stored and nothing logged above debug level.
+- The recovered measurement is accepted only when the user ID echoed by the
+  scale matches a configured profile and the final weight is still within that
+  profile's recognition window, so a stale or foreign ID cannot write a
+  measurement to the wrong user.
+- Dropped measurement cycles are now logged as warnings and counted in
+  `ignored_cycle_count`, exposed in diagnostics and on the session status
+  entity, so a lost weigh-in is no longer silent at the default log level.
+
 ## 0.4.2 - 2026-08-06
 
 ### Fixed
