@@ -164,6 +164,22 @@ defaults in that case.
 Bluetooth proxy operation has not yet been validated. Low-level power
 optimization is not applied through a proxy.
 
+### Weigh-ins that start before the connection is ready
+
+The scale streams live weight frames continuously while a weigh-in is in
+progress, and those frames drive user recognition. When a weigh-in starts
+before the persistent connection has reached `ready` — common over a Bluetooth
+proxy, where a connection can take several seconds — the frames that make up
+the recognition plateau are lost.
+
+Those cycles are recovered instead of discarded: the integration attributes the
+measurement from the user ID the scale itself reports in its final frame, and
+accepts it only when that ID belongs to a configured profile **and** the final
+weight still agrees with that profile's reference weight within the
+`Maximum relative difference` window. A stale or foreign ID can therefore never
+write a measurement to the wrong user, and a final frame the integration cannot
+attribute is reported rather than dropped silently.
+
 ## Status values
 
 - `starting`
@@ -174,7 +190,10 @@ optimization is not applied through a proxy.
 - `measuring`
 
 An unknown user or incomplete measurement is ignored without deliberately
-disconnecting the scale.
+disconnecting the scale. Every ignored measurement cycle is logged as a
+warning and counted in the `ignored_cycle_count` diagnostic, so a session that
+returns to `ready` without a new measurement is distinguishable from one where
+nobody weighed in.
 
 ## Diagnostics and privacy
 

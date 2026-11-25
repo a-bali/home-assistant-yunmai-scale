@@ -109,6 +109,9 @@ class YunmaiStatusSensor(YunmaiBaseSensor):
         attributes.update(self.manager.ble_power_details)
         if self.manager.last_error is not None:
             attributes["last_error"] = self.manager.last_error
+        if self.manager.ignored_cycle_count:
+            attributes["ignored_cycle_count"] = self.manager.ignored_cycle_count
+            attributes["last_ignored_reason"] = self.manager.last_ignored_reason
         return attributes
 
 

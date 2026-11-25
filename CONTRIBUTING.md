@@ -8,6 +8,9 @@ Before opening a pull request:
 2. Preserve backward compatibility for existing config entries and entity unique IDs.
 3. Do not add speculative writes to unknown GATT characteristics.
 4. Run Python syntax checks and validate all JSON files.
-5. Explain the hardware and Home Assistant installation used for testing.
+5. Run the regression tests: `python3 tests/run_tests.py`. They exercise the
+   measurement state machine through `tests/_stubs`, which are import-only
+   stand-ins for Home Assistant, so no instance is required.
+6. Explain the hardware and Home Assistant installation used for testing.
 
 Never include private Home Assistant diagnostics, access tokens, precise personal measurements, or unredacted logs in a public issue.
